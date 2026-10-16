@@ -125,6 +125,16 @@ pub enum Hit {
         id: ShapeId,
         row: usize,
     },
+    /// Crop handle 0..8 (NW, N, NE, E, SE, S, SW, W) of the picture in crop mode.
+    Crop {
+        id: ShapeId,
+        handle: u8,
+    },
+    /// The picture in crop mode, inside its frame or on the cropped-away part: dragging it moves
+    /// the picture under the frame.
+    CropPicture {
+        id: ShapeId,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -214,6 +224,15 @@ enum Drag {
         points: Vec<Point>,
         pressed: bool,
     },
+    /// Crop mode: dragging crop handle `handle` (`Some`) or the picture under its frame (`None`).
+    /// `orig` and `crop` are the frame and crop at the press.
+    Crop {
+        id: ShapeId,
+        handle: Option<u8>,
+        orig: Xfrm,
+        crop: [f64; 4],
+        start: Point,
+    },
 }
 
 /// Shape-gallery names that draw a freeform path instead of a preset.
@@ -263,6 +282,8 @@ pub struct ToolState {
     pub edit_vertex: Option<(usize, usize)>,
     /// The point type last chosen for a vertex (path, index, type): handle drags follow it.
     pub vertex_kind: Option<(usize, usize, String)>,
+    /// The picture in crop mode (Picture Format ▸ Crop): crop handles instead of the box's.
+    pub crop: Option<ShapeId>,
     /// Drawing guides are shown (View › Guides): they can be dragged and shapes snap to them.
     pub guides_visible: bool,
     /// The guide being dragged and where it is now (slide points); `None` once dropped.
@@ -281,6 +302,15 @@ impl ToolState {
     /// The shape in Edit Points, while it is still the one selected shape.
     pub fn editing_points(&self, st: &crate::DocState) -> Option<ShapeId> {
         self.edit_points.filter(|id| st.selection.shapes.as_slice() == [*id] && st.selection.text.is_none() && st.shape(*id).is_some())
+    }
+
+    /// The picture in crop mode, while it is still the one selected, unlocked picture.
+    pub fn cropping(&self, st: &crate::DocState) -> Option<ShapeId> {
+        self.crop.filter(|id| {
+            st.selection.shapes.as_slice() == [*id]
+                && st.selection.text.is_none()
+                && st.shape(*id).is_some_and(|s| matches!(s.kind, ShapeKind::Picture { .. }) && !s.locked)
+        })
     }
 
     /// A freeform path is being drawn (Enter/Escape/double-click finish it).
@@ -352,6 +382,23 @@ impl Session {
     /// What's under `p` on the current slide.
     pub fn hit_test(&self, p: Point, tol: f64) -> Option<Hit> {
         let st = self.active()?;
+        // In crop mode the picture's crop handles and the picture itself are all there is to hit.
+        if let Some(id) = self.tool.cropping(st)
+            && let Some(sh) = st.shape(id)
+        {
+            let x = xfrm_of(&st.doc, &st.selection, sh);
+            for (i, q) in box_handles(&x).0.iter().enumerate() {
+                if (*q - p).hypot() <= tol * 1.6 {
+                    return Some(Hit::Crop { id, handle: i as u8 });
+                }
+            }
+            let local = x.affine().inverse() * p;
+            let frame = Rect::new(0.0, 0.0, x.w, x.h).inflate(tol, tol);
+            let whole = deckcraft_render::crop_dest(Rect::new(0.0, 0.0, x.w, x.h), picture_crop(sh));
+            if frame.contains(local) || whole.contains(local) {
+                return Some(Hit::CropPicture { id });
+            }
+        }
         // In Edit Points, the edited shape's vertices come first.
         if let Some(id) = self.tool.editing_points(st)
             && let Some(sh) = st.shape(id)
@@ -550,6 +597,24 @@ impl Session {
             return Ok(json!({"caret": [pos.0, pos.1]}));
         }
         let hit = self.hit_test(p, tol);
+        // Crop mode: drag a crop handle or the picture; a press anywhere else leaves crop mode.
+        if self.tool.crop.is_some() {
+            let st = self.doc()?;
+            let target = match hit {
+                Some(Hit::Crop { id, handle }) => Some((id, Some(handle))),
+                Some(Hit::CropPicture { id }) => Some((id, None)),
+                _ => None,
+            };
+            if let Some((id, handle)) = target
+                && let Some(sh) = st.shape(id)
+            {
+                let (orig, crop) = (xfrm_of(&st.doc, &st.selection, sh), picture_crop(sh));
+                self.begin("Crop");
+                self.tool.drag = Some(Drag::Crop { id, handle, orig, crop, start: p });
+                return Ok(json!({"hit": serde_json::to_value(&hit).unwrap_or_default()}));
+            }
+            self.tool.crop = None;
+        }
         // Edit Points: drag a vertex, Ctrl-click one to delete it or the outline to add one;
         // a click anywhere else leaves Edit Points.
         if let Some(eid) = self.doc().ok().and_then(|st| self.tool.editing_points(st)) {
@@ -601,8 +666,8 @@ impl Session {
                 self.begin("Rotate");
                 self.tool.drag = Some(Drag::Rotate { ids, center, start, origs });
             }
-            // Only reached outside Edit Points (handled above).
-            Some(Hit::Vertex { .. } | Hit::Handle { .. }) => {}
+            // Only reached outside Edit Points and crop mode (handled above).
+            Some(Hit::Vertex { .. } | Hit::Handle { .. } | Hit::Crop { .. } | Hit::CropPicture { .. }) => {}
             Some(Hit::Adjust { id, index }) => {
                 let orig = st.shape(id).map(|s| xfrm_of(&st.doc, &st.selection, s)).unwrap_or_default();
                 self.begin("Adjust Shape");
@@ -951,6 +1016,24 @@ impl Session {
                 self.tool.ink_preview = points.clone();
                 self.tool.drag = Some(Drag::Ink { points });
             }
+            Drag::Crop { id, handle, orig, crop, start } => {
+                let inv = orig.affine().inverse();
+                let d = inv * p - inv * start;
+                let (x, c) = match handle {
+                    Some(h) => crop_side(&orig, crop, h, d),
+                    None => (orig, crop_move(&orig, crop, d)),
+                };
+                self.edit(|doc, sel| {
+                    let list = crate::shapes_mut(doc, sel).ok_or_else(|| cmd::bad("crop", "no slide"))?;
+                    if let Some(sh) = deckcraft_model::find_shape_mut(list, id)
+                        && let ShapeKind::Picture { fill } = &mut sh.kind
+                    {
+                        sh.xfrm = Some(x);
+                        fill.crop = c;
+                    }
+                    Ok(())
+                })?;
+            }
         }
         Ok(Value::Null)
     }
@@ -1195,7 +1278,9 @@ impl Session {
                 | Hit::Frame { id }
                 | Hit::TableColumn { id, .. }
                 | Hit::TableRow { id, .. }
-                | Hit::Warp { id, .. },
+                | Hit::Warp { id, .. }
+                | Hit::Crop { id, .. }
+                | Hit::CropPicture { id },
             ) => Some(*id),
             None => None,
         };
@@ -1789,6 +1874,73 @@ pub fn resize_box(o: &Xfrm, h: u8, d: Vec2, keep_aspect: bool, from_center: bool
     let local_c = Point::new((l + r) / 2.0 * sx + if sx < 0.0 { o.w } else { 0.0 }, (t + b) / 2.0 * sy + if sy < 0.0 { o.h } else { 0.0 });
     let c = o.affine() * Point::new(if o.flip_h { o.w - local_c.x } else { local_c.x }, if o.flip_v { o.h - local_c.y } else { local_c.y });
     Xfrm { x: c.x - nw / 2.0, y: c.y - nh / 2.0, w: nw, h: nh, rot: o.rot, flip_h: fh, flip_v: fv }
+}
+
+/// A picture's crop (left, top, right, bottom fractions), with non-finite values as 0.
+fn picture_crop(sh: &Shape) -> [f64; 4] {
+    match &sh.kind {
+        ShapeKind::Picture { fill } => fill.crop.map(|v| if v.is_finite() { v } else { 0.0 }),
+        _ => [0.0; 4],
+    }
+}
+
+/// The whole picture of a cropped frame `x` (crop fractions `crop`) as a box on the slide, rotated
+/// and flipped with the frame: where crop mode shows the cropped-away parts.
+pub fn crop_whole_xfrm(x: &Xfrm, crop: [f64; 4]) -> Xfrm {
+    let f = deckcraft_render::crop_dest(Rect::new(0.0, 0.0, x.w, x.h), crop);
+    let c = x.affine() * f.center();
+    Xfrm { x: c.x - f.width() / 2.0, y: c.y - f.height() / 2.0, w: f.width(), h: f.height(), ..*x }
+}
+
+/// The crop of frame `(l, t, r, b)` (in the frame-local coordinates of `x`) over the whole picture `f`.
+fn crop_for(f: Rect, (l, t, r, b): (f64, f64, f64, f64)) -> [f64; 4] {
+    let (fw, fh) = (f.width().max(1e-9), f.height().max(1e-9));
+    [(l - f.x0) / fw, (t - f.y0) / fh, (f.x1 - r) / fw, (f.y1 - b) / fh].map(|v| v.clamp(-10.0, 0.99))
+}
+
+/// Crop mode, dragging crop handle `h` (0..8: NW, N, NE, E, SE, S, SW, W) of frame `x` by `d`
+/// (frame-local points): that side of the frame moves and its crop changes with it, while the
+/// picture stays where it is on the slide. Returns the new frame and crop.
+pub fn crop_side(x: &Xfrm, crop: [f64; 4], h: u8, d: Vec2) -> (Xfrm, [f64; 4]) {
+    let f = deckcraft_render::crop_dest(Rect::new(0.0, 0.0, x.w, x.h), crop);
+    // The frame keeps a sliver of the picture and never reaches past ten picture widths (the
+    // furthest a crop pads).
+    let (min_w, min_h) = ((f.width() * 0.02).max(1.0), (f.height() * 0.02).max(1.0));
+    let (lo_x, hi_x) = (f.x0 - 10.0 * f.width(), f.x1 + 10.0 * f.width());
+    let (lo_y, hi_y) = (f.y0 - 10.0 * f.height(), f.y1 + 10.0 * f.height());
+    let (mut l, mut t, mut r, mut b) = (0.0, 0.0, x.w, x.h);
+    if matches!(h, 0 | 6 | 7) {
+        l = (l + d.x).clamp(lo_x, (r - min_w).max(lo_x));
+    }
+    if matches!(h, 2..=4) {
+        r = (r + d.x).clamp((l + min_w).min(hi_x), hi_x);
+    }
+    if matches!(h, 0..=2) {
+        t = (t + d.y).clamp(lo_y, (b - min_h).max(lo_y));
+    }
+    if matches!(h, 4..=6) {
+        b = (b + d.y).clamp((t + min_h).min(hi_y), hi_y);
+    }
+    if ![l, t, r, b].iter().all(|v| v.is_finite()) {
+        return (*x, crop);
+    }
+    let c = x.affine() * Point::new((l + r) / 2.0, (t + b) / 2.0);
+    let (w, hh) = (r - l, b - t);
+    (Xfrm { x: c.x - w / 2.0, y: c.y - hh / 2.0, w, h: hh, ..*x }, crop_for(f, (l, t, r, b)))
+}
+
+/// Crop mode, dragging the picture by `d` (frame-local points) under frame `x`: the frame stays,
+/// the crop shifts. The picture keeps at least a sliver inside the frame.
+pub fn crop_move(x: &Xfrm, crop: [f64; 4], d: Vec2) -> [f64; 4] {
+    let f = deckcraft_render::crop_dest(Rect::new(0.0, 0.0, x.w, x.h), crop);
+    let reach = |len: f64, size: f64, lo: f64, hi: f64, v: f64| {
+        // Keep each side's crop within -10..0.99 picture sizes.
+        let (a, b) = (-lo - 0.99 * size, len - hi + 0.99 * size);
+        if a <= b && v.is_finite() { v.clamp(a, b) } else { 0.0 }
+    };
+    let dx = reach(x.w, f.width(), f.x0, f.x1, d.x);
+    let dy = reach(x.h, f.height(), f.y0, f.y1, d.y);
+    crop_for(f + Vec2::new(dx, dy), (0.0, 0.0, x.w, x.h))
 }
 
 fn hit_shape(st: &crate::DocState, sh: &Shape, p: Point, tol: f64) -> Option<Hit> {

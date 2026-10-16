@@ -758,7 +758,7 @@ fn pointer(app: &mut SlideApp, ui: &Ui, resp: &egui::Response, xf: Xf) {
         (ToolKind::Shape { .. }, _) => egui::CursorIcon::Crosshair,
         (ToolKind::TextBox, _) => egui::CursorIcon::Text,
         (ToolKind::Ink { .. }, _) => egui::CursorIcon::Crosshair,
-        (_, Some(Hit::Resize { handle, .. })) => match handle {
+        (_, Some(Hit::Resize { handle, .. } | Hit::Crop { handle, .. })) => match handle {
             0 | 4 => egui::CursorIcon::ResizeNwSe,
             2 | 6 => egui::CursorIcon::ResizeNeSw,
             1 | 5 => egui::CursorIcon::ResizeVertical,
@@ -775,7 +775,7 @@ fn pointer(app: &mut SlideApp, ui: &Ui, resp: &egui::Response, xf: Xf) {
                 egui::CursorIcon::Move
             }
         }
-        (_, Some(Hit::Shape { .. } | Hit::Frame { .. })) => egui::CursorIcon::Move,
+        (_, Some(Hit::Shape { .. } | Hit::Frame { .. } | Hit::CropPicture { .. })) => egui::CursorIcon::Move,
         _ => match app.session.tool.guide_drag.map(|g| g.0).or(app.session.tool.guide_hover) {
             Some(i) if app.session.active().and_then(|d| d.doc.guides.get(i)).is_some_and(|g| g.vertical) => egui::CursorIcon::ResizeHorizontal,
             Some(_) => egui::CursorIcon::ResizeVertical,
@@ -827,6 +827,27 @@ fn overlays(app: &mut SlideApp, ui: &Ui, painter: &egui::Painter, xf: Xf, t: &To
             continue;
         }
         let editing_this = editing.as_ref().is_some_and(|e| e.shape == *id && !e.notes);
+        if app.session.tool.cropping(st) == Some(sh.id)
+            && let deckcraft_model::ShapeKind::Picture { fill } = &sh.kind
+        {
+            // Crop mode: the whole picture shows faintly around the frame, the frame has black
+            // crop marks at its corners and sides, as in PowerPoint.
+            let whole = deckcraft_engine::tools::crop_whole_xfrm(&x, fill.crop);
+            if st.selection.target == Target::Slides {
+                let scale = f64::from(xf.scale * ui.ctx().pixels_per_point());
+                if let Some((tex, cover)) = app.textures.crop_ghost(ui.ctx(), &st.doc, st.selection.slide, sh.id, whole, scale) {
+                    let r = Rect::from_two_pos(xf.to_screen(Point::new(cover.x0, cover.y0)), xf.to_screen(Point::new(cover.x1, cover.y1)));
+                    painter.image(tex.id(), r, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE.gamma_multiply(0.45));
+                }
+            }
+            let wa = whole.affine();
+            let outline = [Point::new(0.0, 0.0), Point::new(whole.w, 0.0), Point::new(whole.w, whole.h), Point::new(0.0, whole.h)]
+                .map(|q| xf.to_screen(wa * q));
+            poly(painter, outline, Stroke::new(1.0, t.text_faint));
+            poly(painter, corners, sel_stroke);
+            crop_marks(painter, corners);
+            continue;
+        }
         if app.session.tool.editing_points(st) == Some(sh.id) {
             // Edit Points: the outline's vertices are the handles.
             // No selection box: the outline and its vertices are what's edited.
@@ -1028,6 +1049,29 @@ pub(crate) fn text_marks(st: &deckcraft_engine::DocState, ts: &deckcraft_engine:
         .map(|r| [Point::new(r.x0, r.y0), Point::new(r.x1, r.y0), Point::new(r.x1, r.y1), Point::new(r.x0, r.y1)].map(|q| m * q))
         .collect();
     Some(TextMarks { selection })
+}
+
+/// Crop mode's handles on frame `c` (screen corners NW, NE, SE, SW): black corner angles and
+/// side bars, outlined in white so they show on any picture.
+fn crop_marks(p: &egui::Painter, c: [Pos2; 4]) {
+    let toward = |a: Pos2, b: Pos2| {
+        let d = b - a;
+        let len = d.length();
+        if len > 1e-3 { d / len * 10.0f32.min(len / 3.0) } else { vec2(0.0, 0.0) }
+    };
+    let mut marks: Vec<[Pos2; 3]> = Vec::with_capacity(8);
+    for i in 0..4 {
+        let (prev, here, next) = (c[(i + 3) % 4], c[i], c[(i + 1) % 4]);
+        marks.push([here + toward(here, prev), here, here + toward(here, next)]);
+        let mid = here + (next - here) / 2.0;
+        let along = toward(here, next) * 0.6;
+        marks.push([mid - along, mid, mid + along]);
+    }
+    for (w, col) in [(5.0, Color32::WHITE), (3.0, Color32::BLACK)] {
+        for m in &marks {
+            p.add(egui::Shape::line(m.to_vec(), Stroke::new(w, col)));
+        }
+    }
 }
 
 fn rotate_handle(p: &egui::Painter, c: Pos2, t: &Tokens) {
@@ -1244,6 +1288,10 @@ fn context_menu(app: &mut SlideApp, resp: &egui::Response) {
                 .session
                 .active()
                 .is_some_and(|d| d.selected_shapes().iter().any(|s| matches!(s.kind, deckcraft_model::ShapeKind::Picture { .. })));
+            if picture && ui.button("Crop").clicked() {
+                let _ = app.run("picture.cropMode", json!({"on": true}));
+                ui.close();
+            }
             if picture && ui.button("Change Picture…").clicked() {
                 let _ = app.run("app.changePictureDialog", json!({}));
                 ui.close();

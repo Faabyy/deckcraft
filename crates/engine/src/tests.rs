@@ -1971,6 +1971,101 @@ fn edit_points_with_the_pointer_and_curves() {
 }
 
 #[test]
+fn crop_mode_crops_a_side_and_moves_the_picture_under_the_frame() {
+    // #823: Crop offered only fixed 10 % / 20 % crops; crop mode crops freely with the pointer.
+    use crate::tools::{Hit, Mods, PointerEvent, PointerKind, crop_whole_xfrm};
+    use deckcraft_geom::Point;
+    const PNG: &[u8] = &[
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0xf8, 0xcf,
+        0xc0, 0xf0, 0x1f, 0x00, 0x05, 0x00, 0x01, 0xff, 0x89, 0x99, 0x3d, 0x1d, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60,
+        0x82,
+    ];
+    let mut s = session();
+    s.execute("slide.new", &json!({"layout": "blank"})).unwrap();
+    let r = s.execute("insert.picture", &json!({"data": cmd::base64_encode(PNG), "name": "a.png", "rect": [100.0, 100.0, 200.0, 100.0]})).unwrap();
+    let id = ShapeId(r["id"].as_u64().unwrap() as u32);
+    let state = |s: &Session| {
+        let sh = s.doc().unwrap().shape(id).unwrap().clone();
+        let deckcraft_model::ShapeKind::Picture { fill } = &sh.kind else { panic!("not a picture") };
+        (sh.xfrm.unwrap(), fill.crop)
+    };
+    let (x0, _) = state(&s);
+    let close = |a: [f64; 4], b: [f64; 4]| a.iter().zip(b).all(|(a, b)| (a - b).abs() < 1e-9);
+    let ev = |kind, x: f64, y: f64| PointerEvent { kind, x, y, mods: Mods::default(), tol: 3.0, pressure: None };
+    let drag = |s: &mut Session, (ax, ay): (f64, f64), (bx, by): (f64, f64)| {
+        s.pointer(ev(PointerKind::Down, ax, ay)).unwrap();
+        s.pointer(ev(PointerKind::Drag, (ax + bx) / 2.0, (ay + by) / 2.0)).unwrap();
+        s.pointer(ev(PointerKind::Drag, bx, by)).unwrap();
+        s.pointer(ev(PointerKind::Up, bx, by)).unwrap();
+    };
+    // Only a picture has a crop mode.
+    s.execute("shape.insert", &json!({"preset": "rect", "rect": [400, 300, 50, 50]})).unwrap();
+    assert!(s.execute("picture.cropMode", &json!({"on": true})).is_err());
+    assert_eq!(s.execute("picture.cropMode", &json!({"on": true, "id": id.0})).unwrap()["cropping"], json!(id.0));
+    assert_eq!(s.doc().unwrap().selection.shapes, vec![id]);
+    // In crop mode the right-hand handle is a crop handle, not a resize handle.
+    assert_eq!(s.hit_test(Point::new(300.0, 150.0), 3.0), Some(Hit::Crop { id, handle: 3 }));
+    assert_eq!(s.hit_test(Point::new(200.0, 150.0), 3.0), Some(Hit::CropPicture { id }));
+    let undo_depth = s.doc().unwrap().history.undo.len();
+    // Dragging it 50 pt left crops a quarter off the right; the picture stays where it was.
+    drag(&mut s, (300.0, 150.0), (250.0, 150.0));
+    let (x, c) = state(&s);
+    assert!((x.x - 100.0).abs() < 1e-9 && (x.w - 150.0).abs() < 1e-9 && (x.h - 100.0).abs() < 1e-9, "{x:?}");
+    assert!(close(c, [0.0, 0.0, 0.25, 0.0]), "{c:?}");
+    let whole = crop_whole_xfrm(&x, c);
+    assert!((whole.x - x0.x).abs() < 1e-9 && (whole.w - x0.w).abs() < 1e-9, "{whole:?}");
+    // The cropped-away part is still the picture: dragging there moves it under the frame.
+    assert_eq!(s.hit_test(Point::new(280.0, 150.0), 3.0), Some(Hit::CropPicture { id }));
+    drag(&mut s, (150.0, 150.0), (130.0, 150.0));
+    let (x2, c) = state(&s);
+    assert_eq!(x2, x, "the frame stays");
+    assert!(close(c, [0.1, 0.0, 0.15, 0.0]), "{c:?}");
+    // Each drag is one undo step.
+    assert_eq!(s.doc().unwrap().history.undo.len(), undo_depth + 2);
+    s.execute("edit.undo", &json!({})).unwrap();
+    assert!(close(state(&s).1, [0.0, 0.0, 0.25, 0.0]));
+    s.execute("edit.undo", &json!({})).unwrap();
+    assert_eq!(state(&s), (x0, [0.0; 4]));
+    // Escape leaves crop mode: the handle resizes again.
+    s.key("Escape", Mods::default()).unwrap();
+    assert!(s.tool.crop.is_none());
+    assert_eq!(s.hit_test(Point::new(300.0, 150.0), 3.0), Some(Hit::Resize { id, handle: 3 }));
+    // A click away from the picture leaves crop mode too.
+    s.execute("picture.cropMode", &json!({})).unwrap();
+    assert_eq!(s.tool.crop, Some(id));
+    s.pointer(ev(PointerKind::Down, 600.0, 450.0)).unwrap();
+    s.pointer(ev(PointerKind::Up, 600.0, 450.0)).unwrap();
+    assert!(s.tool.crop.is_none());
+    assert_eq!(state(&s), (x0, [0.0; 4]));
+}
+
+#[test]
+fn crop_handles_keep_a_rotated_flipped_picture_in_place() {
+    use crate::tools::{crop_move, crop_side, crop_whole_xfrm};
+    use deckcraft_geom::{Vec2, Xfrm};
+    let x = Xfrm { x: 100.0, y: 80.0, w: 160.0, h: 90.0, rot: 30.0, flip_h: true, flip_v: false };
+    let crop = [0.1, 0.2, 0.1, 0.0];
+    let whole = crop_whole_xfrm(&x, crop);
+    let near = |a: &Xfrm, b: &Xfrm| [a.x - b.x, a.y - b.y, a.w - b.w, a.h - b.h, a.rot - b.rot].iter().all(|d| d.abs() < 1e-6);
+    for h in 0..8 {
+        for d in [Vec2::new(-20.0, 15.0), Vec2::new(35.0, -10.0), Vec2::new(1e9, -1e9)] {
+            let (nx, nc) = crop_side(&x, crop, h, d);
+            assert!(nx.w > 0.0 && nx.h > 0.0 && nc.iter().all(|v| (-10.0..=0.99).contains(v)), "{h} {d:?}: {nx:?} {nc:?}");
+            assert!(near(&crop_whole_xfrm(&nx, nc), &whole), "{h} {d:?}: the picture moved");
+        }
+        // Hostile input leaves the frame as it was.
+        assert_eq!(crop_side(&x, crop, h, Vec2::new(f64::NAN, 0.0)), (x, crop));
+    }
+    // Moving the picture shifts its crop by the move, and never past a sliver inside the frame.
+    let c = crop_move(&x, crop, Vec2::new(-20.0, 0.0));
+    let fw = 160.0 / 0.8;
+    assert!((c[0] - (0.1 + 20.0 / fw)).abs() < 1e-9 && (c[2] - (0.1 - 20.0 / fw)).abs() < 1e-9 && c[1] == 0.2 && c[3] == 0.0, "{c:?}");
+    let far = crop_move(&x, crop, Vec2::new(1e9, f64::INFINITY));
+    assert!(far.iter().all(|v| (-10.0..=0.99).contains(v)), "{far:?}");
+}
+
+#[test]
 fn edit_points_path_parse_and_write() {
     use crate::cmd::points::{Seg, parse, vertices, write};
     let segs = parse("M 0 0 L 10 0 C 10 5 5 10 0 10 Z junk L");

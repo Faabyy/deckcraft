@@ -139,6 +139,15 @@ pub fn specs() -> Vec<CommandSpec> {
             crop
         ),
         cmd!(
+            noundo "picture.cropMode",
+            "Crop",
+            ["Picture Format", "Size", "Crop"],
+            None,
+            "{on?: bool (default: toggle), id?} — enter or leave crop mode for one selected picture: its crop handles crop a side, dragging the picture moves it under the frame; Esc, Enter or a click elsewhere leaves",
+            has_selection,
+            crop_mode
+        ),
+        cmd!(
             "picture.adjust",
             "Corrections",
             ["Picture Format", "Adjust"],
@@ -1048,6 +1057,37 @@ fn crop(s: &mut Session, p: &Value) -> Result<Value> {
         }
         Ok(())
     })
+}
+
+fn crop_mode(s: &mut Session, p: &Value) -> Result<Value> {
+    let on = p.get("on").and_then(Value::as_bool).unwrap_or(s.tool.crop.is_none());
+    if !on {
+        s.tool.crop = None;
+        return Ok(json!({"cropping": Value::Null}));
+    }
+    let st = s.doc()?;
+    let id = match p.get("id").and_then(Value::as_u64) {
+        Some(i) => deckcraft_model::ShapeId(u32::try_from(i).map_err(|_| bad("picture.cropMode", "no such shape"))?),
+        None => match st.selection.shapes.as_slice() {
+            [one] => *one,
+            _ => return Err(bad("picture.cropMode", "select one picture")),
+        },
+    };
+    let sh = st.shape(id).ok_or_else(|| bad("picture.cropMode", "no such shape"))?;
+    if !matches!(sh.kind, deckcraft_model::ShapeKind::Picture { .. }) {
+        return Err(bad("picture.cropMode", "only a picture can be cropped"));
+    }
+    if sh.locked {
+        return Err(bad("picture.cropMode", "the picture is locked"));
+    }
+    s.select(|_, sel| {
+        sel.shapes = vec![id];
+        sel.text = None;
+        sel.cells = None;
+    })?;
+    s.tool.edit_points = None;
+    s.tool.crop = Some(id);
+    Ok(json!({"cropping": id.0}))
 }
 
 fn picture_adjust(s: &mut Session, p: &Value) -> Result<Value> {

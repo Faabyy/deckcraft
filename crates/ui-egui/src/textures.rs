@@ -50,6 +50,8 @@ pub struct Textures {
     /// SmartArt gallery pictures by layout, style and colours (and, for hover previews, the
     /// outline's hash).
     smartart: HashMap<String, TextureHandle>,
+    /// Crop mode: the whole picture being cropped, by what it was drawn from.
+    crop_ghost: Option<(String, TextureHandle)>,
     clock: u64,
     pub last_render_ms: f64,
 }
@@ -338,6 +340,45 @@ impl Textures {
         };
         self.canvas = Some(Entry { key, tex: tex.clone(), region, _slide: slide, _master: master, stamp: 0 });
         Some((tex, region))
+    }
+
+    /// Crop mode: the whole of picture `id` on slide `slide` (its crop undone, without outline or
+    /// effects) placed at `whole`, at `scale` texture pixels per point. Returns the texture and the
+    /// slide rectangle it covers. Moving the picture only moves the rectangle; the picture is drawn
+    /// again when its size, rotation or look changes.
+    pub fn crop_ghost(
+        &mut self,
+        ctx: &egui::Context,
+        p: &Presentation,
+        slide: usize,
+        id: ShapeId,
+        whole: deckcraft_geom::Xfrm,
+        scale: f64,
+    ) -> Option<(TextureHandle, Rect)> {
+        let sl = p.slides.get(slide)?;
+        let sh = deckcraft_model::find_shape(&sl.shapes, id)?;
+        let deckcraft_model::ShapeKind::Picture { fill } = &sh.kind else { return None };
+        let cover = whole.bounds().inflate(8.0, 8.0);
+        if !(cover.width().is_finite() && cover.height().is_finite() && cover.width() > 0.0 && cover.height() > 0.0) {
+            return None;
+        }
+        let scale = scale.min(2048.0 / cover.width().max(cover.height()));
+        if !(scale.is_finite() && scale > 0.0) {
+            return None;
+        }
+        let fill = deckcraft_model::style::PictureFill { crop: [0.0; 4], ..fill.clone() };
+        let key = format!("{}|{:?}|{:.3}|{:.3}|{:.3}|{}|{}|{:.4}", id.0, fill, whole.w, whole.h, whole.rot, whole.flip_h, whole.flip_v, scale);
+        if let Some((k, tex)) = &self.crop_ghost
+            && *k == key
+        {
+            return Some((tex.clone(), cover));
+        }
+        let ghost = deckcraft_model::Shape { id, kind: deckcraft_model::ShapeKind::Picture { fill }, xfrm: Some(whole), ..Default::default() };
+        let one = Slide { shapes: vec![ghost], ..sl.as_ref().clone() };
+        let img = deckcraft_render::render_shape(p, &one, id, scale)?;
+        let tex = upload(ctx, "crop-ghost", to_color_image(&img, false));
+        self.crop_ghost = Some((key, tex.clone()));
+        Some((tex, cover))
     }
 
     /// Cached thumbnails (bounded; soak tests check it).
