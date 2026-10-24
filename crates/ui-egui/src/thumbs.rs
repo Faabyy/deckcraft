@@ -248,7 +248,7 @@ pub fn slide_menu(app: &mut SlideApp, ui: &mut Ui, i: usize) {
         ui.close();
     }
     if ui.button("Save Slides As…").clicked() {
-        app.save_slides_as_dialog();
+        app.save_slides_as_dialog(json!({}));
         ui.close();
     }
     ui.separator();

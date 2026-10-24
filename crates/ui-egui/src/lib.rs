@@ -1392,7 +1392,7 @@ impl SlideApp {
             "app.reuseSlidesDialog" => self.pick_and_reuse(p.get("keepFormatting").and_then(Value::as_bool).unwrap_or(false)),
             "app.insertVideoDialog" => self.pick_and_insert("video", "insert.video"),
             "app.saveAsDialog" => self.save_as_dialog("deckcraft"),
-            "app.saveSlidesAsDialog" => self.save_slides_as_dialog(),
+            "app.saveSlidesAsDialog" => self.save_slides_as_dialog(json!({})),
             "app.splitDialog" => self.dialog = Some(dialogs::Dialog::new("splitPresentation")),
             "app.exportDialog" => self.dialog = Some(dialogs::Dialog::new("export")),
             "app.pasteSpecial" => self.dialog = Some(dialogs::Dialog::new("pasteSpecial")),
@@ -1754,14 +1754,20 @@ impl SlideApp {
 
     /// File › Save Selected Slides As…: write the selected slides to a new file. The open
     /// presentation stays as it is.
-    pub fn save_slides_as_dialog(&mut self) {
+    /// `params` are further `file.saveSlidesAs` parameters (e.g. `slides`); without them the
+    /// selected slides are saved.
+    pub fn save_slides_as_dialog(&mut self, mut params: Value) {
         let Some(name) = self.session.active().map(|d| d.title()) else { return };
         let Some(pick) = self.services.pick_save.as_mut() else {
             self.set_status("Saving part of a presentation needs the desktop app".to_string());
             return;
         };
         if let Some(path) = pick(&format!("{name} (selected slides).pptx")) {
-            match self.session.execute("file.saveSlidesAs", &json!({"path": path})) {
+            if !params.is_object() {
+                params = json!({});
+            }
+            params["path"] = json!(path);
+            match self.session.execute("file.saveSlidesAs", &params) {
                 Ok(r) => self.set_status(format!("Saved {} slide(s) to {path}", r.get("slides").and_then(Value::as_u64).unwrap_or(0))),
                 Err(e) => self.set_status(e.to_string()),
             }
@@ -1823,9 +1829,11 @@ impl SlideApp {
                 UiRequest::Pane { id } => self.ui.pane = Some(id),
                 UiRequest::StartShow { from } => self.start_show(from, false),
                 UiRequest::Message { text } => self.set_status(text),
-                UiRequest::PickFile { purpose } => match purpose.as_str() {
+                UiRequest::PickFile { purpose, params } => match purpose.as_str() {
                     "saveAs" => self.save_as_dialog("deckcraft"),
-                    "saveSlidesAs" => self.save_slides_as_dialog(),
+                    "saveSlidesAs" => self.save_slides_as_dialog(params),
+                    // A request that already says how to split only needs the file name.
+                    "splitPresentation" if params.get("every").is_some() || params.get("bySection").is_some() => self.split_presentation(params),
                     "splitPresentation" => self.dialog = Some(dialogs::Dialog::new("splitPresentation")),
                     _ => {}
                 },
