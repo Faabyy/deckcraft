@@ -124,14 +124,24 @@ fn target_format(p: &Value, path: &str, cmd: &str) -> Result<String> {
 
 fn save_slides_as(s: &mut Session, p: &Value) -> Result<Value> {
     let Some(path) = str_param(p, "path").map(String::from) else {
-        s.ui_requests.push(crate::UiRequest::PickFile { purpose: "saveSlidesAs".into() });
+        s.ui_requests.push(crate::UiRequest::PickFile { purpose: "saveSlidesAs".into(), params: p.clone() });
         return Ok(json!({"needsPath": true}));
     };
+    refuse_the_open_file(s, &path, "file.saveSlidesAs")?;
     let indices = slides_param(s, p, "file.saveSlidesAs")?;
     let format = target_format(p, &path, "file.saveSlidesAs")?;
     let bytes = save_bytes(&slice(&s.doc()?.doc, &indices), &format)?;
     crate::io::write_file(&path, &bytes).map_err(EngineError::Other)?;
     Ok(json!({"path": path, "slides": indices.len(), "bytes": bytes.len()}))
+}
+
+/// The open presentation is unchanged in memory, so writing part of it over its own file would
+/// lose the rest of it on disk.
+fn refuse_the_open_file(s: &Session, path: &str, cmd: &str) -> Result<()> {
+    match s.active().and_then(|d| d.path.as_deref()) {
+        Some(open) if crate::io::same_file(open, path) => Err(bad(cmd, format!("{path} is the open presentation; choose another file name"))),
+        _ => Ok(()),
+    }
 }
 
 /// `(file stem, extension)` of the base path, e.g. `("/d/talk", "pptx")`.
@@ -149,7 +159,7 @@ fn file_safe(name: &str) -> String {
 
 fn split(s: &mut Session, p: &Value) -> Result<Value> {
     let Some(path) = str_param(p, "path").map(String::from) else {
-        s.ui_requests.push(crate::UiRequest::PickFile { purpose: "splitPresentation".into() });
+        s.ui_requests.push(crate::UiRequest::PickFile { purpose: "splitPresentation".into(), params: p.clone() });
         return Ok(json!({"needsPath": true}));
     };
     let format = target_format(p, &path, "file.split")?;
@@ -190,8 +200,8 @@ fn split(s: &mut Session, p: &Value) -> Result<Value> {
     if parts.len() < 2 {
         return Err(bad("file.split", "the presentation would stay in one piece; there is nothing to split"));
     }
-    // Everything is encoded and every name checked before the first file is written, so a failure
-    // leaves no half-split folder behind.
+    // Everything is encoded and every name checked before the first file is written, so a bad
+    // name or encoding leaves nothing behind. A write that fails later says which parts are written.
     let width = parts.len().to_string().len();
     let overwrite = bool_or(p, "overwrite", false);
     let mut out: Vec<(String, usize, Vec<u8>)> = vec![];
@@ -201,14 +211,18 @@ fn split(s: &mut Session, p: &Value) -> Result<Value> {
             Some(l) => format!("{stem}-{:0width$}-{l}.{ext}", k + 1),
             None => format!("{stem}-{:0width$}.{ext}", k + 1),
         };
+        refuse_the_open_file(s, &file, "file.split")?;
         if !overwrite && crate::io::file_len(&file).is_some() {
             return Err(bad("file.split", format!("{file} exists already; pass `overwrite: true` to replace it")));
         }
         out.push((file, idx.len(), save_bytes(&slice(&doc, idx), &format)?));
     }
-    let mut files = vec![];
+    let mut files: Vec<Value> = vec![];
     for (file, slides, bytes) in out {
-        crate::io::write_file(&file, &bytes).map_err(EngineError::Other)?;
+        if let Err(e) = crate::io::write_file(&file, &bytes) {
+            let done: Vec<&str> = files.iter().filter_map(|f| f["path"].as_str()).collect();
+            return Err(EngineError::Other(if done.is_empty() { e } else { format!("{e} (already written: {})", done.join(", ")) }));
+        }
         files.push(json!({"path": file, "slides": slides, "bytes": bytes.len()}));
     }
     Ok(json!({"files": files}))
@@ -219,7 +233,7 @@ fn split(s: &mut Session, p: &Value) -> Result<Value> {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     use crate::Session;
 
@@ -344,5 +358,38 @@ mod tests {
         assert!(part.media.iter().all(|m| m.name != "orphan.png"), "media nothing refers to is left out");
         assert!(!part.masters.is_empty());
         assert!(part.validate().is_empty(), "{:?}", part.validate());
+    }
+
+    #[test]
+    fn saving_slides_over_the_open_presentation_is_refused() {
+        let dir = scratch("self");
+        let mut s = deck(3);
+        let own = dir.join("talk.pptx");
+        s.execute("file.saveAs", &json!({"path": own.to_str().unwrap()})).unwrap();
+        let before = std::fs::read(&own).unwrap();
+        s.execute("slide.selectSlides", &json!({"indices": [0]})).unwrap();
+        // Also when the same file is spelled differently.
+        let other_spelling = dir.join(".").join("talk.pptx");
+        for path in [own.to_str().unwrap(), other_spelling.to_str().unwrap()] {
+            assert!(s.execute("file.saveSlidesAs", &json!({"path": path})).is_err(), "{path}");
+        }
+        assert_eq!(std::fs::read(&own).unwrap(), before, "the presentation's file is untouched");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_request_for_a_file_name_keeps_the_other_parameters() {
+        let mut s = deck(4);
+        s.execute("file.saveSlidesAs", &json!({"slides": [1, 2]})).unwrap();
+        s.execute("file.split", &json!({"every": 3})).unwrap();
+        let params: Vec<(String, Value)> = s
+            .ui_requests
+            .iter()
+            .filter_map(|r| match r {
+                crate::UiRequest::PickFile { purpose, params } => Some((purpose.clone(), params.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(params, vec![("saveSlidesAs".into(), json!({"slides": [1, 2]})), ("splitPresentation".into(), json!({"every": 3}))]);
     }
 }
