@@ -1752,21 +1752,25 @@ impl SlideApp {
         }
     }
 
-    /// File › Save Selected Slides As…: write the selected slides to a new file. The open
-    /// presentation stays as it is.
+    /// File › Save Selected Slides As…: write the selected slides to a new file (the save picker
+    /// on the desktop, a download on the web). The open presentation stays as it is.
     /// `params` are further `file.saveSlidesAs` parameters (e.g. `slides`); without them the
     /// selected slides are saved.
     pub fn save_slides_as_dialog(&mut self, mut params: Value) {
         let Some(name) = self.session.active().map(|d| d.title()) else { return };
+        if !params.is_object() {
+            params = json!({});
+        }
+        let suggested = format!("{name} (selected slides).pptx");
         let Some(pick) = self.services.pick_save.as_mut() else {
-            self.set_status("Saving part of a presentation needs the desktop app".to_string());
+            let bytes = deckcraft_engine::cmd::split::slides_file(&self.session, &params, &suggested).map(|(_, b)| b);
+            self.download(&suggested, bytes);
             return;
         };
-        if let Some(path) = pick(&format!("{name} (selected slides).pptx")) {
-            if !params.is_object() {
-                params = json!({});
-            }
+        if let Some(path) = pick(&suggested) {
             params["path"] = json!(path);
+            // The save picker has already asked before replacing a file.
+            params["overwrite"] = json!(true);
             match self.session.execute("file.saveSlidesAs", &params) {
                 Ok(r) => self.set_status(format!("Saved {} slide(s) to {path}", r.get("slides").and_then(Value::as_u64).unwrap_or(0))),
                 Err(e) => self.set_status(e.to_string()),
@@ -1774,12 +1778,13 @@ impl SlideApp {
         }
     }
 
-    /// File › Split Presentation…: ask for the base file name, then write the parts next to it.
+    /// File › Split Presentation…: ask for the base file name, then write the parts next to it
+    /// (on the web, each part is a download named the same way).
     /// `params` are the `file.split` parameters without `path`.
     pub fn split_presentation(&mut self, mut params: Value) {
         let Some(name) = self.session.active().map(|d| d.title()) else { return };
         let Some(pick) = self.services.pick_save.as_mut() else {
-            self.set_status("Splitting a presentation needs the desktop app".to_string());
+            self.download_split(&format!("{name}.pptx"), &params);
             return;
         };
         let Some(path) = pick(&format!("{name}.pptx")) else { return };
@@ -1788,6 +1793,26 @@ impl SlideApp {
         }
         match self.session.execute("file.split", &params) {
             Ok(r) => self.set_status(format!("Split into {} files", r.get("files").and_then(Value::as_array).map_or(0, Vec::len))),
+            Err(e) => self.set_status(e.to_string()),
+        }
+    }
+
+    /// The web's Split Presentation: every part is handed to the browser as a download named like
+    /// the desktop's files (`<name>-1.pptx` …). Every part is encoded before the first download.
+    fn download_split(&mut self, base: &str, params: &Value) {
+        use deckcraft_engine::cmd::split::{part_bytes, split_plan};
+        let encoded = (|| {
+            let (format, parts) = split_plan(&self.session, params, base)?;
+            let doc = self.session.doc()?.doc.clone();
+            parts.into_iter().map(|(file, idx)| Ok((file, part_bytes(&doc, &idx, &format)?))).collect::<deckcraft_engine::Result<Vec<_>>>()
+        })();
+        match encoded {
+            Ok(files) => {
+                let n = files.len();
+                if files.into_iter().fold(true, |ok, (file, bytes)| self.download(&file, Ok(bytes)) && ok) {
+                    self.set_status(format!("Split into {n} files"));
+                }
+            }
             Err(e) => self.set_status(e.to_string()),
         }
     }
@@ -3729,6 +3754,36 @@ mod tests {
         assert_eq!(corner_alpha(&got[0].1), 255, "opaque by default");
         assert_eq!(corner_alpha(&got[1].1), 0, "transparent background");
         assert_eq!(corner_alpha(&got[2].1), 255, "JPEG has no transparency");
+    }
+
+    /// Without a save picker (the web), Save Selected Slides As and Split Presentation download
+    /// their files instead of stopping.
+    #[test]
+    fn web_saves_selected_slides_and_split_parts_as_downloads() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let got: Rc<RefCell<Vec<(String, Vec<u8>)>>> = Rc::default();
+        let log = got.clone();
+        let services = Services {
+            download: Some(Box::new(move |name: &str, b: &[u8]| log.borrow_mut().push((name.to_string(), b.to_vec())))),
+            ..Default::default()
+        };
+        let mut app = SlideApp::new(Session::with_new(), services);
+        for _ in 0..3 {
+            app.session.execute("slide.new", &json!({})).unwrap();
+        }
+        app.session.execute("slide.selectSlides", &json!({"indices": [1, 2]})).unwrap();
+        app.save_slides_as_dialog(json!({}));
+        app.split_presentation(json!({"every": 2}));
+        let got = got.borrow();
+        let names: Vec<&str> = got.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names.len(), 3, "{names:?}");
+        assert!(names[0].ends_with(" (selected slides).pptx"), "{names:?}");
+        assert!(names[1].ends_with("-1.pptx") && names[2].ends_with("-2.pptx"), "{names:?}");
+        let slides = |b: &[u8]| deckcraft_engine::cmd::file::open_presentation("x.pptx", b).unwrap().slides.len();
+        assert_eq!(slides(&got[0].1), 2);
+        assert_eq!(slides(&got[1].1), 2);
+        assert_eq!(slides(&got[2].1), 2);
     }
 
     fn title_text(app: &SlideApp) -> String {
