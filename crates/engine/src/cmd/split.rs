@@ -11,7 +11,7 @@ use deckcraft_model::{Presentation, SlideId};
 use serde_json::{Value, json};
 
 use super::file::{parse_slide_range, save_bytes, writable_format_for_path};
-use super::*;
+use super::{CommandSpec, bad, bool_or, cmd, has_doc, str_param, usize_param};
 use crate::{EngineError, Result, Session, media_refs};
 
 /// Most files one split writes, so a typo (`every: 1` on a huge deck) can't fill a folder.
